@@ -14,24 +14,30 @@
 
 存储结构:
     数据/八大报纸/人民日报/2026/2026-10-27.csv     # 每报每日一张表
-    数据/八大报纸/当日汇总/2026-10-27.csv           # 当日八报合并表（便于跨报分析）
-    数据/八大报纸/运行日志.txt
+    数据/八大报纸/当日汇总/2026-10-27.csv           # 可选：--combine 时生成（与分表内容重复）
+    数据/八大报纸/运行日志.txt                      # 1MB 轮转，最多保留 2 份
 
 字段: 报纸 / 发布日期 / 版面序号 / 版面名称 / 标题 / 副标题 / 作者 / 来源 / 摘要 / 正文 / 字数 / 链接 / 采集时间
 
 用法:
-    python 八大报纸_爬虫.py                          # 抓今天全部八报
+    python 八大报纸_爬虫.py                          # 抓今天全部八报（只写分表）
     python 八大报纸_爬虫.py --papers 人民日报,经济日报
     python 八大报纸_爬虫.py --date 2026-10-27
     python 八大报纸_爬虫.py --no-body                # 只抓标题与版面，不抓正文（快）
     python 八大报纸_爬虫.py --jobs 8                 # 正文并发数
+    python 八大报纸_爬虫.py --combine                # 额外生成当日合并表
     python 八大报纸_爬虫.py --combine-only --date 2026-10-27   # 仅重建当日汇总表
 
-重复运行幂等：同一链接自动合并/跳过，可安全用于每日计划任务。
+重复运行幂等：同一链接自动合并/跳过，内容无变化时不重写文件，可安全用于每日计划任务。
 """
+
+import sys
+
+sys.dont_write_bytecode = True  # 不生成 __pycache__，减少无谓磁盘写入
 
 import argparse
 import csv
+import io
 import json
 import logging
 import os
@@ -40,6 +46,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urljoin
 
 import requests
@@ -65,7 +72,7 @@ WRITE_LOCK = threading.Lock()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('八大报纸')
 os.makedirs(OUT_DIR, exist_ok=True)
-_fh = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
+_fh = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=2, encoding='utf-8')
 _fh.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(_fh)
 
@@ -603,16 +610,28 @@ def save_records(paper, date, records):
             key = rec['链接']
             if rec.get('正文'):
                 # 正文抓取成功：以本次结果为准（避免旧的错漏字段残留）
-                rows[key] = {k: rec.get(k, '') for k in FIELDS}
+                new = {k: str(rec.get(k) if rec.get(k) is not None else '') for k in FIELDS}
+                old = rows.get(key)
+                # 内容未变则保留旧记录（含采集时间），避免整表重写
+                if old and all((old.get(k) or '') == new[k] for k in FIELDS if k != '采集时间'):
+                    new = old
+                rows[key] = new
             else:
                 old = rows.get(key, {})
                 rows[key] = {k: rec.get(k) or old.get(k, '') for k in FIELDS}
         rows = {k: v for k, v in rows.items() if not is_placeholder(v)}
         ordered = sorted(rows.values(), key=lambda r: (r.get('版面序号') or '', r.get('标题') or ''))
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=FIELDS)
+        writer.writeheader()
+        writer.writerows(ordered)
+        text = buf.getvalue()
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8-sig', newline='') as f:
+                if f.read() == text:
+                    return len(rows)  # 无变化不落盘
         with open(path, 'w', encoding='utf-8-sig', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=FIELDS)
-            writer.writeheader()
-            writer.writerows(ordered)
+            f.write(text)
     return len(rows)
 
 
@@ -627,10 +646,17 @@ def combine_day(date):
                     rows.extend(list(csv.DictReader(f)))
     os.makedirs(COMBINE_DIR, exist_ok=True)
     out = os.path.join(COMBINE_DIR, f'{date}.csv')
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=FIELDS)
+    writer.writeheader()
+    writer.writerows(rows)
+    text = buf.getvalue()
+    if os.path.exists(out):
+        with open(out, 'r', encoding='utf-8-sig', newline='') as f:
+            if f.read() == text:
+                return len(rows), out
     with open(out, 'w', encoding='utf-8-sig', newline='') as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDS)
-        writer.writeheader()
-        writer.writerows(rows)
+        f.write(text)
     return len(rows), out
 
 
@@ -651,7 +677,7 @@ JOBS = 6
 FETCH_BODY = True
 
 
-def run(date, papers):
+def run(date, papers, combine=False):
     logger.info('===== 开始抓取 %s：%s =====', date, '、'.join(papers))
     started = datetime.now()
     result = {}
@@ -668,8 +694,10 @@ def run(date, papers):
         total = save_records(paper, date, recs)
         result[paper] = (len(recs), total)
         logger.info('%s 完成：新增 %s 条，当日累计 %s 条', paper, len(recs), total)
-    count, out = combine_day(date)
-    logger.info('当日汇总 %s 条 -> %s', count, out)
+    count = sum(total for _, total in result.values())
+    if combine:
+        count, out = combine_day(date)
+        logger.info('当日汇总 %s 条 -> %s', count, out)
     cost = (datetime.now() - started).total_seconds()
     logger.info('全部完成：%.1f 秒', cost)
     return result, count
@@ -737,6 +765,7 @@ def main():
     parser.add_argument('--papers', default='', help='逗号分隔的报纸名，默认全部')
     parser.add_argument('--jobs', type=int, default=6, help='正文并发数')
     parser.add_argument('--no-body', action='store_true', help='不抓正文，仅标题与版面')
+    parser.add_argument('--combine', action='store_true', help='额外生成当日八报合并表（默认不生成，省磁盘）')
     parser.add_argument('--combine-only', action='store_true', help='仅重建当日汇总表')
     args = parser.parse_args()
 
@@ -758,7 +787,7 @@ def main():
     if unknown:
         parser.error('未知报纸: ' + '、'.join(unknown))
 
-    result, count = run(date, papers)
+    result, count = run(date, papers, combine=args.combine)
 
     print('\n' + '=' * 46)
     print(f'{date} 八大报纸抓取结果')
@@ -766,7 +795,9 @@ def main():
     for paper, (new, total) in result.items():
         print(f'{paper:<8} 本次 {new:>4} 条   当日累计 {total:>4} 条')
     print('-' * 46)
-    print(f'合并总表 {count} 条：{os.path.join(COMBINE_DIR, date + ".csv")}')
+    print(f'当日合计 {count} 条（按报纸分表存储）')
+    if args.combine:
+        print(f'合并总表：{os.path.join(COMBINE_DIR, date + ".csv")}')
 
 
 if __name__ == '__main__':
