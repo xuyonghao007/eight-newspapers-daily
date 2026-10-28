@@ -14,18 +14,18 @@
 
 存储结构:
     数据/八大报纸/人民日报/2026/2026-10-27.csv     # 每报每日一张表
-    数据/八大报纸/当日汇总/2026-10-27.csv           # 可选：--combine 时生成（与分表内容重复）
+    数据/八大报纸/当日汇总/2026-10-27.csv           # 八报合并表（默认生成，可用 --no-combine 关闭）
     数据/八大报纸/运行日志.txt                      # 1MB 轮转，最多保留 2 份
 
 字段: 报纸 / 发布日期 / 版面序号 / 版面名称 / 标题 / 副标题 / 作者 / 来源 / 摘要 / 正文 / 字数 / 链接 / 采集时间
 
 用法:
-    python 八大报纸_爬虫.py                          # 抓今天全部八报（只写分表）
+    python 八大报纸_爬虫.py                          # 抓今天全部八报，并生成当日汇总
     python 八大报纸_爬虫.py --papers 人民日报,经济日报
     python 八大报纸_爬虫.py --date 2026-10-27
     python 八大报纸_爬虫.py --no-body                # 只抓标题与版面，不抓正文（快）
+    python 八大报纸_爬虫.py --no-combine             # 只写分表，不生成当日汇总
     python 八大报纸_爬虫.py --jobs 8                 # 正文并发数
-    python 八大报纸_爬虫.py --combine                # 额外生成当日合并表
     python 八大报纸_爬虫.py --combine-only --date 2026-10-27   # 仅重建当日汇总表
 
 重复运行幂等：同一链接自动合并/跳过，内容无变化时不重写文件，可安全用于每日计划任务。
@@ -765,7 +765,8 @@ def main():
     parser.add_argument('--papers', default='', help='逗号分隔的报纸名，默认全部')
     parser.add_argument('--jobs', type=int, default=6, help='正文并发数')
     parser.add_argument('--no-body', action='store_true', help='不抓正文，仅标题与版面')
-    parser.add_argument('--combine', action='store_true', help='额外生成当日八报合并表（默认不生成，省磁盘）')
+    parser.add_argument('--combine', dest='combine', action='store_true', default=True, help='生成当日八报合并表（默认开启）')
+    parser.add_argument('--no-combine', dest='combine', action='store_false', help='不生成当日合并表')
     parser.add_argument('--combine-only', action='store_true', help='仅重建当日汇总表')
     args = parser.parse_args()
 
