@@ -12,19 +12,25 @@
     解放军报   http://www.81.cn/szb_223187/szblb/
     工人日报   http://www.workercn.cn/papers/grrb/
 
+另含《求是》（半月刊，非每日更新）:
+    https://www.qstheory.cn/  —— 每日只做增量检查，无新期次时不写盘
+
 存储结构:
     数据/八大报纸/人民日报/2026/2026-10-27.csv     # 每报每日一张表
     数据/八大报纸/当日汇总/2026-10-27.csv           # 八报合并表（默认生成，可用 --no-combine 关闭）
+    数据/八大报纸/求是/2026/2026-11-14.csv          # 按月按出版日期落盘，一期一表
     数据/八大报纸/运行日志.txt                      # 1MB 轮转，最多保留 2 份
 
 字段: 报纸 / 发布日期 / 版面序号 / 版面名称 / 标题 / 副标题 / 作者 / 来源 / 摘要 / 正文 / 字数 / 链接 / 采集时间
 
 用法:
-    python 八大报纸_爬虫.py                          # 抓今天全部八报，并生成当日汇总
+    python 八大报纸_爬虫.py                          # 抓今天全部八报 + 求是增量，并生成当日汇总
     python 八大报纸_爬虫.py --papers 人民日报,经济日报
+    python 八大报纸_爬虫.py --papers 求是             # 只跑求是增量检查
     python 八大报纸_爬虫.py --date 2026-10-27
-    python 八大报纸_爬虫.py --no-body                # 只抓标题与版面，不抓正文（快）
+    python 八大报纸_爬虫.py --no-body                # 只抓标题与版面，不抓正文（快，同时跳过求是）
     python 八大报纸_爬虫.py --no-combine             # 只写分表，不生成当日汇总
+    python 八大报纸_爬虫.py --no-qiushi              # 跳过求是
     python 八大报纸_爬虫.py --jobs 8                 # 正文并发数
     python 八大报纸_爬虫.py --combine-only --date 2026-10-27   # 仅重建当日汇总表
 
@@ -559,6 +565,173 @@ def crawl_grrb(date):
     return records
 
 
+# ---------------------------------------------------------------- 求是（半月刊，非每日更新）
+QS_DIR = os.path.join(OUT_DIR, '求是')
+QS_YEAR_URLS = {
+    2026: 'https://www.qstheory.cn/20251231/2d916da295774130ac2fb223fd208895/c.html',
+    2025: 'https://www.qstheory.cn/20250101/f1fa7777504340aa8e6609e602eed4d1/c.html',
+}
+
+
+def qs_issue_no(title):
+    m = re.search(r'第\s*(\d+)\s*期', title or '')
+    return int(m.group(1)) if m else 0
+
+
+def qs_issue_date(url):
+    """期次链接路径含出版日期，如 /20261114/xxx/c.html"""
+    m = re.search(r'/(\d{4})(\d{2})(\d{2})/', url or '')
+    return f'{m.group(1)}-{m.group(2)}-{m.group(3)}' if m else ''
+
+
+def qs_year_index(year_url):
+    """年度目录 -> [{期号, 期次, 链接, 出版日期}]"""
+    html = fetch(year_url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, 'html.parser')
+    out, seen = [], set()
+    for a in soup.find_all('a', href=True):
+        title = clean(a.get_text())
+        if not re.search(r'《求是》\d{4}年第\d+期', title):
+            continue
+        url = urljoin(year_url, a['href'])
+        if url in seen:
+            continue
+        seen.add(url)
+        out.append({'期号': qs_issue_no(title), '期次': title,
+                    '链接': url, '出版日期': qs_issue_date(url)})
+    return sorted(out, key=lambda x: x['期号'])
+
+
+def qs_toc(issue_url):
+    """期次目录 -> [{标题, 链接}]"""
+    html = fetch(issue_url)
+    if not html:
+        return []
+    soup = BeautifulSoup(html, 'html.parser')
+    out, seen = [], set()
+    for a in soup.find_all('a', href=True):
+        href = a['href']
+        title = clean(a.get_text())
+        if not href.endswith('/c.html') or len(title) < 4 or '本期导读' in title:
+            continue
+        url = urljoin(issue_url, href)
+        if url == issue_url or url in seen:
+            continue
+        seen.add(url)
+        out.append({'标题': title, '链接': url})
+    return out
+
+
+def qs_article(url):
+    """文章页 -> {标题, 作者, 正文, 来源}"""
+    html = fetch(url)
+    if not html:
+        return {}
+    soup = BeautifulSoup(html, 'html.parser')
+    h1 = soup.find('h1')
+    title = clean(h1.get_text()) if h1 else ''
+
+    text = soup.get_text(' ', strip=True)
+    author = ''
+    m = re.search(r'作者[：:]\s*(.+?)\s+\d{4}-\d{2}-\d{2}', text)
+    if m:
+        author = clean(m.group(1))
+    else:
+        m = re.search(r'作者[：:]\s*([^\s]{2,30})', text)
+        if m:
+            author = clean(m.group(1))
+
+    body = ''
+    # 正文只在 div.content > div.text 内，避免把标题/来源/作者/时间行带进正文
+    node = (soup.select_one('div.content div.text') or soup.select_one('div.text')
+            or soup.select_one('div.content') or soup.select_one('div#content'))
+    if node:
+        for tag in node.find_all(['script', 'style', 'iframe']):
+            tag.decompose()
+        lines = [x.strip() for x in node.get_text('\n', strip=True).split('\n') if x.strip()]
+        if lines and clean(lines[0]) == title:
+            lines = lines[1:]
+        # 去掉正文首行的作者署名（与"作者"字段重复）
+        if lines and author and re.sub(r'\s+', '', lines[0]) == re.sub(r'\s+', '', author):
+            lines = lines[1:]
+        if lines and lines[0][:1] in ('※', '＊', '*'):
+            lines = lines[1:]
+        body = '\n'.join(lines)
+    return {'标题': title, '作者': author, '正文': body, '来源': '求是'}
+
+
+def run_qiushi(date, fetch_body=True, refresh=False):
+    """增量补抓求是：只处理尚未入库、且已出版的期次；无新期次时不写盘"""
+    year = int(date[:4])
+    year_url = QS_YEAR_URLS.get(year)
+    if not year_url:
+        logger.info('求是：%s 年未配置年度目录，跳过', year)
+        return [], 0
+    if not fetch_body:
+        logger.info('求是：--no-body 模式跳过')
+        return [], 0
+
+    issues = qs_year_index(year_url)
+    if not issues:
+        logger.warning('求是：%s 年度目录解析失败，跳过', year)
+        return [], 0
+
+    folder = os.path.join(QS_DIR, str(year))
+    os.makedirs(folder, exist_ok=True)
+    done = {os.path.splitext(f)[0] for f in os.listdir(folder) if f.endswith('.csv')}
+    if refresh:
+        todo = [i for i in issues if i['出版日期'] and i['出版日期'] <= date]
+    else:
+        todo = [i for i in issues
+                if i['出版日期'] and i['出版日期'] <= date and i['出版日期'] not in done]
+    if not todo:
+        logger.info('求是 %s：无新期次（已入库 %s 期）', year, len(done))
+        return [], 0
+    logger.info('求是 %s：待补 %s 期（%s）', year, len(todo),
+                '、'.join(i['期次'] for i in todo))
+
+    fetched, total = [], 0
+    for issue in todo:
+        arts = qs_toc(issue['链接'])
+        logger.info('求是 %s：目录 %s 篇', issue['期次'], len(arts))
+        if not arts:
+            logger.warning('求是 %s：目录为空，跳过', issue['期次'])
+            continue
+        records = []
+        with ThreadPoolExecutor(max_workers=JOBS) as pool:
+            futures = {pool.submit(qs_article, a['链接']): a for a in arts}
+            for fut in as_completed(futures):
+                art = futures[fut]
+                try:
+                    detail = fut.result() or {}
+                except Exception as exc:
+                    logger.warning('求是正文解析失败 %s: %s', art['链接'], exc)
+                    detail = {}
+                body = clean_body(detail.get('正文') or '')
+                records.append({
+                    '报纸': '求是',
+                    '发布日期': issue['出版日期'],
+                    '版面序号': f"{issue['期号']:02d}",
+                    '版面名称': issue['期次'],
+                    '标题': clean(detail.get('标题')) or art['标题'],
+                    '副标题': '',
+                    '作者': clean(detail.get('作者')),
+                    '来源': '求是',
+                    '摘要': body[:150],
+                    '正文': body,
+                    '字数': len(body),
+                    '链接': art['链接'],
+                    '采集时间': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                })
+        n = save_records('求是', issue['出版日期'], records, year_dir=year)
+        total += n
+        fetched.append(issue)
+        logger.info('求是 %s 完成：%s 篇', issue['期次'], n)
+    return fetched, total
+
+
 def build(paper, date, page, art, detail):
     body = clean_body(detail.get('正文') or '')
     title = clean(detail.get('标题')) or art.get('标题', '')
@@ -594,11 +767,11 @@ def is_placeholder(rec):
         or title in ('导读', '广告')
 
 
-def save_records(paper, date, records):
+def save_records(paper, date, records, year_dir=None):
     records = [r for r in records if not is_placeholder(r)]
     if not records:
         return 0
-    folder = os.path.join(OUT_DIR, paper, date[:4])
+    folder = os.path.join(OUT_DIR, paper, str(year_dir or date[:4]))
     os.makedirs(folder, exist_ok=True)
     path = os.path.join(folder, f'{date}.csv')
     with WRITE_LOCK:
@@ -636,10 +809,10 @@ def save_records(paper, date, records):
 
 
 def combine_day(date):
-    """把当日各报 CSV 合并为一张表"""
+    """把当日各报 CSV 合并为一张表（求是仅在其出版日出现）"""
     rows = []
     if os.path.isdir(OUT_DIR):
-        for paper in PAPERS:
+        for paper in PAPERS + ['求是']:
             path = os.path.join(OUT_DIR, paper, date[:4], f'{date}.csv')
             if os.path.exists(path):
                 with open(path, 'r', encoding='utf-8-sig', newline='') as f:
@@ -672,16 +845,19 @@ CRAWLERS = {
     '工人日报': crawl_grrb,
 }
 PAPERS = list(CRAWLERS)
+PERIODICALS = ['求是']
+TARGETS = PAPERS + PERIODICALS
 
 JOBS = 6
 FETCH_BODY = True
+QIUSHI_REFRESH = False
 
 
 def run(date, papers, combine=False):
     logger.info('===== 开始抓取 %s：%s =====', date, '、'.join(papers))
     started = datetime.now()
     result = {}
-    for paper in papers:
+    for paper in [p for p in papers if p in CRAWLERS]:
         if not FETCH_BODY:
             # 只抓版面与标题时走各报简化流程：仍调用适配器，但正文置空
             recs = run_titles_only(paper, date)
@@ -694,13 +870,16 @@ def run(date, papers, combine=False):
         total = save_records(paper, date, recs)
         result[paper] = (len(recs), total)
         logger.info('%s 完成：新增 %s 条，当日累计 %s 条', paper, len(recs), total)
+    qiushi = None
+    if '求是' in papers:
+        qiushi = run_qiushi(date, fetch_body=FETCH_BODY, refresh=QIUSHI_REFRESH)
     count = sum(total for _, total in result.values())
     if combine:
         count, out = combine_day(date)
         logger.info('当日汇总 %s 条 -> %s', count, out)
     cost = (datetime.now() - started).total_seconds()
     logger.info('全部完成：%.1f 秒', cost)
-    return result, count
+    return result, count, qiushi
 
 
 def run_titles_only(paper, date):
@@ -759,7 +938,7 @@ def titles_from_pc(pages, date, paper):
 
 
 def main():
-    global JOBS, FETCH_BODY
+    global JOBS, FETCH_BODY, QIUSHI_REFRESH
     parser = argparse.ArgumentParser(description='八大党报电子报爬虫（每日全量）')
     parser.add_argument('--date', default=datetime.now().strftime('%Y-%m-%d'), help='抓取日期 YYYY-MM-DD')
     parser.add_argument('--papers', default='', help='逗号分隔的报纸名，默认全部')
@@ -768,10 +947,13 @@ def main():
     parser.add_argument('--combine', dest='combine', action='store_true', default=True, help='生成当日八报合并表（默认开启）')
     parser.add_argument('--no-combine', dest='combine', action='store_false', help='不生成当日合并表')
     parser.add_argument('--combine-only', action='store_true', help='仅重建当日汇总表')
+    parser.add_argument('--no-qiushi', action='store_true', help='跳过《求是》增量检查')
+    parser.add_argument('--qiushi-refresh', action='store_true', help='重抓《求是》本年度全部已出版期次（解析规则变更时用）')
     args = parser.parse_args()
 
     JOBS = max(1, args.jobs)
     FETCH_BODY = not args.no_body
+    QIUSHI_REFRESH = args.qiushi_refresh
     date = args.date
     try:
         datetime.strptime(date, '%Y-%m-%d')
@@ -783,18 +965,26 @@ def main():
         print(f'当日汇总 {count} 条 -> {out}')
         return
 
-    papers = [p.strip() for p in args.papers.split(',') if p.strip()] or PAPERS
-    unknown = [p for p in papers if p not in CRAWLERS]
+    papers = [p.strip() for p in args.papers.split(',') if p.strip()] or list(TARGETS)
+    if args.no_qiushi:
+        papers = [p for p in papers if p != '求是']
+    unknown = [p for p in papers if p not in CRAWLERS and p not in PERIODICALS]
     if unknown:
         parser.error('未知报纸: ' + '、'.join(unknown))
 
-    result, count = run(date, papers, combine=args.combine)
+    result, count, qiushi = run(date, papers, combine=args.combine)
 
     print('\n' + '=' * 46)
     print(f'{date} 八大报纸抓取结果')
     print('=' * 46)
     for paper, (new, total) in result.items():
         print(f'{paper:<8} 本次 {new:>4} 条   当日累计 {total:>4} 条')
+    if qiushi is not None:
+        issues, articles = qiushi
+        if issues:
+            print(f'{"求是":<8} 新增 {len(issues)} 期（{",".join(i["期次"] for i in issues)}）  {articles:>4} 篇')
+        else:
+            print(f'{"求是":<8} 无新期次')
     print('-' * 46)
     print(f'当日合计 {count} 条（按报纸分表存储）')
     if args.combine:
